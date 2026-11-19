@@ -1,6 +1,7 @@
 {
   "name": "danger-close-server",
   "version": "1.0.0",
+  "description": "Multiplayer relay server for Danger Close Shelter",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,5 +10,8 @@
     "express": "^4.21.0",
     "socket.io": "^4.8.0",
     "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
