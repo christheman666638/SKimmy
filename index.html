@@ -95,9 +95,10 @@ p{margin:0;line-height:1.5;color:var(--ink);max-width:62ch}
     <div class="card">
       <div class="eyebrow">Squad play · up to 8 runners</div>
       <h2>Squad lobby</h2>
-      <p class="dim" id="mpOff" hidden>Squad play needs the Claude viewer with live rooms, and a signed-in account that can edit or contribute to this page. Solo play still works.</p>
+      <p class="dim" id="mpOff" hidden>Connect to a multiplayer server (set window.DC_SERVER). Solo play still works without a server.</p>
       <div id="mpJoinView" style="display:flex;flex-direction:column;gap:14px">
         <label class="fld">Callsign<input id="mpName" maxlength="14" autocomplete="off" spellcheck="false"></label>
+        <label class="fld">Server URL<input id="mpServer" placeholder="https://your-server.onrender.com" autocomplete="off" spellcheck="false"></label>
         <div class="row"><button class="btn" id="mpCreate">Create squad</button></div>
         <div class="row" style="align-items:center"><input class="codein" id="mpCode" maxlength="8" placeholder="CODE" autocomplete="off" spellcheck="false" aria-label="Squad code"><button class="btn alt sm" id="mpJoin">Join with code</button></div>
         <div class="sub">Open squads</div>
@@ -134,9 +135,89 @@ p{margin:0;line-height:1.5;color:var(--ink);max-width:62ch}
   </div>
 </div>
 
+
+<script>
+/* ===== Danger Close multiplayer adapter (Socket.io) ===== */
+window.DC_SERVER = window.DC_SERVER || localStorage.getItem("dc_server") || (location.protocol === "https:" ? "" : "http://localhost:3000");
+(function(){
+  "use strict";
+  function getServer(){
+    return (window.DC_SERVER || localStorage.getItem("dc_server") || "").replace(/\/$/,"");
+  }
+  if(!getServer()){ console.warn("[DC MP] Set window.DC_SERVER or enter a Server URL in the lobby"); }
+
+  function loadIO(cb){
+    if(window.io) return cb();
+    const s=document.createElement("script");
+    s.src="https://cdn.socket.io/4.8.0/socket.io.min.js";
+    s.onload=cb; s.onerror=()=>console.error("[DC MP] Socket.io failed to load");
+    document.head.appendChild(s);
+  }
+
+  class FakeRoom {
+    constructor(code){ this.code=code; this._peers=[]; this._presence={}; this._handlers={}; this._peerId=null; this._socket=null; this._pending=true; }
+    async _connect(name, create){
+      return new Promise((resolve,reject)=>{
+        const SERVER = getServer();
+        if(!SERVER){ reject(new Error("No server URL configured")); return; }
+        loadIO(()=>{
+          const socket = window.io(SERVER,{transports:["websocket","polling"]});
+          this._socket = socket;
+          socket.on("connect",()=>{
+            socket.emit("join",{code:this.code,name,create},res=>{
+              if(!res||!res.ok){ reject(new Error((res&&res.error)||"join failed")); return; }
+              this._peerId = res.peer;
+              this._pending = false;
+              resolve(this);
+            });
+          });
+          socket.on("connect_error", reject);
+          socket.on("peers", list=>{
+            this._peers = (list||[]).map(p=>({...p, sameTab: p.peer===this._peerId}));
+            (this._handlers.peers||[]).forEach(fn=>fn());
+          });
+          ["go","sh","g","sm","dd","rd"].forEach(type=>{
+            socket.on(type, msg=>{
+              (this._handlers[type]||[]).forEach(fn=>fn({peer:msg.peer, sameTab:msg.peer===this._peerId, data:msg.data||{}}));
+            });
+          });
+        });
+      });
+    }
+    on(type, fn){ (this._handlers[type]=this._handlers[type]||[]).push(fn); return ()=>{ this._handlers[type]=(this._handlers[type]||[]).filter(f=>f!==fn); }; }
+    onPeers(fn){ return this.on("peers", fn); }
+    emit(type, data){ if(this._socket&&this._socket.connected) this._socket.emit(type, data); return Promise.resolve(); }
+    presence(data){ Object.assign(this._presence, data||{}); if(this._socket&&this._socket.connected) this._socket.emit("presence", this._presence); return Promise.resolve(); }
+    peers(){ return this._peers.slice(); }
+    leave(){ if(this._socket){ this._socket.emit("leave"); this._socket.disconnect(); this._socket=null; } }
+  }
+
+  class FakeNS {
+    async join(roomName){
+      const code = String(roomName||"").replace(/^dc-/,"");
+      return new FakeRoom(code);
+    }
+    peers(){ return []; }
+    presence(){}
+    onPeers(){ return ()=>{}; }
+  }
+
+  window.claude = window.claude || {};
+  window.claude.use = function(name){
+    if(name!=="room") return Promise.reject(new Error("unsupported"));
+    // Always expose the API; actual connection checks the URL later
+    return Promise.resolve(new FakeNS());
+  };
+  window.__dcFinishJoin = async function(room, name, create){
+    if(room && room._pending) await room._connect(name, create);
+    return room;
+  };
+})();
+</script>
 <script>
 (()=>{
 'use strict';
+
 const $=id=>document.getElementById(id);
 const cv=$('cv'), ctx=cv.getContext('2d');
 const dk=document.createElement('canvas'), dctx=dk.getContext('2d');
@@ -2340,9 +2421,25 @@ async function mpJoinCode(code,create){
   if(code.length<3){$('mpMsg').textContent='Enter a squad code of at least 3 letters or digits.';return}
   const name=cleanName($('mpName').value)||('Runner'+(10+Math.random()*89|0));
   try{localStorage.setItem('dc_name',name)}catch(e){}
+  // Apply server URL from the lobby field
+  const srvEl=$('mpServer');
+  if(srvEl){
+    let srv=(srvEl.value||'').trim().replace(/\/$/,'');
+    if(srv){
+      window.DC_SERVER=srv;
+      try{localStorage.setItem('dc_server',srv)}catch(e){}
+    }
+  }
+  if(!window.DC_SERVER){
+    $('mpMsg').textContent='Enter a Server URL first (e.g. your Render/Railway link).';
+    return;
+  }
   $('mpMsg').textContent='Connecting…';
   let room;
   try{room=await MP.ns.join('dc-'+code)}catch(e){$('mpMsg').textContent='Could not open that squad ('+((e&&e.code)||'error')+').';return}
+  try{
+    if(window.__dcFinishJoin) await window.__dcFinishJoin(room, name, create);
+  }catch(e){$('mpMsg').textContent='Could not connect to server ('+(e.message||e)+'). Check DC_SERVER.';return}
   MP.room=room;MP.code=code;MP.name=name;MP.unsub=[];MP.ready=false;
   mpWire(room);
   mpPres({n:name,r:false,j:Date.now(),c:create?1:0,st:'lobby',k:0});
@@ -2373,6 +2470,10 @@ function mpBack(){
 function mpOpen(){
   $('scrTitle').hidden=true;$('scrMP').hidden=false;
   try{if(!$('mpName').value)$('mpName').value=localStorage.getItem('dc_name')||''}catch(e){}
+  try{
+    const s=$('mpServer');
+    if(s && !s.value) s.value = window.DC_SERVER || localStorage.getItem('dc_server') || '';
+  }catch(e){}
   mpRender();
 }
 function mpRender(){
@@ -2391,7 +2492,7 @@ function mpRender(){
       b.textContent=q.c.toUpperCase()+' · '+(cleanName(q.n)||'Runner')+' · '+(+q.k||1)+' in squad'+(q.p?' · round running':'');
       b.onclick=()=>mpJoinCode(q.c,false);box.appendChild(b);
     }}catch(e){}
-    if(!n){const d=document.createElement('div');d.className='dim';d.textContent='No open squads right now. Create one and share the code.';box.appendChild(d)}
+    if(!n){const d=document.createElement('div');d.className='dim';d.textContent='No public squad list (server has no directory). Create a code and share it with friends.';box.appendChild(d)}
   }
   if(!off&&inRoom){
     const me=mpMe(),host=mpHostId(),ro=mpRoster().slice().sort((a,b)=>a.peer<b.peer?-1:1),box=$('mpRoster');
